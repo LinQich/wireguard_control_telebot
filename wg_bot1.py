@@ -8,6 +8,7 @@ WireGuard Telegram Admin Bot (expanded)
 """
 
 import os
+import time
 import subprocess
 import locale
 import qrcode
@@ -15,17 +16,6 @@ import json
 import hashlib
 import shutil
 from datetime import datetime
-
-def is_peer_online(last_handshake: str, timeout: int = 180) -> bool:
-    """Проверка, онлайн ли пир по времени последнего рукопожатия."""
-    try:
-        ts = int(last_handshake)
-        if ts == 0:
-            return False
-        now = int(datetime.now().timestamp())
-        return (now - ts) <= timeout
-    except ValueError:
-        return False
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -35,6 +25,28 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
+
+# CLEAN CONF FIX — исправление формата Key = Value
+def clean_wg_conf(path):
+    """Приводит конфиг WireGuard к формату 'Key = Value'"""
+    import re
+    try:
+        if not os.path.exists(path):
+            return
+        lines_out = []
+        with open(path, 'r') as f:
+            for line in f:
+                # Исправляем только строки с ключами в формате Key=Value (без пробела)
+                if re.match(r'^[A-Za-z]+=[^=]', line):
+                    key, value = line.split('=', 1)
+                    line = f"{key.strip()} = {value.lstrip()}"
+                lines_out.append(line)
+        with open(path, 'w') as f:
+            f.writelines(lines_out)
+    except Exception as e:
+        print(f"⚠️ Ошибка clean_wg_conf: {e}")
+
+
 
 # -------------------- Paths --------------------
 PARAMS_FILE = "/etc/wireguard/params"
@@ -46,16 +58,32 @@ TEMP_DIR = "/tmp/wg_bot"
 STAT_FILE = "/etc/wireguard/stat"
 WG_INTERFACE = "wg0"
 
-# -------------------- Locale --------------------
-try:
-    locale.setlocale(locale.LC_ALL, 'en_US.UTF-8')
-except:
+# -------------------- Helpers --------------------
+ONLINE_THRESHOLD = 180  # seconds to consider peer online
+
+def last_two_ip_octets(ip: str) -> str:
     try:
-        locale.setlocale(locale.LC_ALL, 'C.UTF-8')
+        ip_only = ip.split('/')[0]
+        parts = ip_only.split('.')
+        if len(parts) == 4:
+            return f"{parts[2]}.{parts[3]}"
     except:
         pass
+    return ""
 
-# -------------------- Helpers --------------------
+def time_since(ts: int) -> str:
+    try:
+        if not ts or int(ts) == 0:
+            return "никогда"
+        delta = int(time.time()) - int(ts)
+        if delta < 0:
+            delta = 0
+        hours = delta // 3600
+        minutes = (delta % 3600) // 60
+        return f"{hours} ч. {minutes} мин. назад"
+    except:
+        return "неизвестно"
+
 def strip_inline_comment(value: str) -> str:
     if value is None:
         return ''
@@ -437,7 +465,6 @@ async def server_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disk_info = subprocess.getoutput("df -h / | awk 'NR==2{printf \"%s/%s\", $3, $2}'")
         wg_stats = subprocess.getoutput(f'wg show {WG_INTERFACE} dump')
         peer_list = []
-        online_peers = []  # будет список (pub_key, last_handshake)
         # Read wg0.conf for PublicKey lines
         if os.path.exists(WG_CONF):
             with open(WG_CONF, 'r') as f:
@@ -448,20 +475,64 @@ async def server_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             pub_key_part = line.split('=', 1)[1].strip()
                             pub_key = normalize_key(pub_key_part)
                             peer_list.append(pub_key)
+        online_peers = []
+        meta_all = load_client_meta()
+        now_ts = int(time.time())
+        interface_info = []
         if wg_stats:
             lines = wg_stats.splitlines()
-            interface_info = lines[0].split('\t') if lines else []
+            if lines:
+                interface_info = lines[0].split('\t')
             for line in lines[1:]:
                 if not line.strip():
                     continue
                 parts = line.split('\t')
+                # parts[0]=pubkey, parts[4]=last_handshake
                 if len(parts) >= 5 and parts[4] != '0':
-                    online_peers.append(parts[0])
+                    try:
+                        last_hs = int(parts[4])
+                    except:
+                        continue
+                    if now_ts - last_hs <= ONLINE_THRESHOLD:
+                        online_peers.append(parts[0])
         client_names = load_client_names()
         online_peers_names = []
+        # try to get IPs for online peers (last two octets)
         for pk in online_peers:
             name = client_names.get(normalize_key(pk), "Без имени")
-            online_peers_names.append(name)
+            ip_val = meta_all.get(normalize_key(pk), {}).get('ip', '')
+            # fallback: try to find AllowedIPs in WG_CONF
+            if not ip_val and os.path.exists(WG_CONF):
+                try:
+                    with open(WG_CONF, 'r') as f:
+                        conf_lines = f.readlines()
+                    i = 0
+                    while i < len(conf_lines):
+                        ln = conf_lines[i].strip()
+                        if ln.lower().startswith('publickey') and '=' in ln:
+                            keypart = normalize_key(ln.split('=',1)[1].strip())
+                            if keypart == pk:
+                                j = i+1
+                                found_ip = ''
+                                while j < len(conf_lines):
+                                    nxt = conf_lines[j].strip()
+                                    if nxt == '' or nxt.startswith('['):
+                                        break
+                                    if nxt.lower().startswith('allowedips') and '=' in nxt:
+                                        try:
+                                            found_ip = nxt.split('=',1)[1].strip().split('/')[0]
+                                        except:
+                                            found_ip = ''
+                                        break
+                                    j += 1
+                                if found_ip:
+                                    ip_val = found_ip
+                                break
+                        i += 1
+                except:
+                    pass
+            last_octets = last_two_ip_octets(ip_val) if ip_val else ""
+            online_peers_names.append((name, last_octets))
         response = (
             f"🖥️ <b>Информация о сервере</b>\n\n"
             f"⏱ <b>Время работы:</b> {uptime}\n"
@@ -473,8 +544,17 @@ async def server_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if online_peers_names:
             response += "\n<b>Пиры в сети:</b>\n"
-            for name in online_peers_names:
-                response += f"• {name} - 🟢 онлайн\n"
+            def _oct_key(x):
+                try:
+                    parts = [int(p) if p.isdigit() else 0 for p in x.split('.')] if x else [0,0]
+                    # ensure two parts
+                    if len(parts) < 2:
+                        parts = [0]*(2-len(parts)) + parts
+                    return parts
+                except:
+                    return [0,0]
+            for name, last_octets in sorted(online_peers_names, key=lambda t: _oct_key(t[1])):
+                response += f"• 🟢{name} - {last_octets}\n"
         if wg_stats and interface_info and len(interface_info) >= 5:
             response += (
                 f"\n<b>Интерфейс {WG_INTERFACE}:</b>\n"
@@ -690,6 +770,7 @@ async def delete_peer_execute(update: Update, context: ContextTypes.DEFAULT_TYPE
     finally:
         context.user_data.clear()
 
+
 async def list_peers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
@@ -702,12 +783,11 @@ async def list_peers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with open(WG_CONF, 'r') as f:
                 for raw in f:
                     line = raw.strip()
-                    if line.lower().startswith('publickey'):
-                        if '=' in line:
-                            pub_key_part = line.split('=', 1)[1].strip()
-                            pub_key = normalize_key(pub_key_part)
-                            name = client_names.get(pub_key, f"Peer {len(peer_list)+1}")
-                            peer_list.append((pub_key, name))
+                    if line.lower().startswith('publickey') and '=' in line:
+                        pub_key_part = line.split('=', 1)[1].strip()
+                        pub_key = normalize_key(pub_key_part)
+                        name = client_names.get(pub_key, f"Peer {len(peer_list)+1}")
+                        peer_list.append((pub_key, name))
         if not peer_list:
             await query.edit_message_text(" ℹ️ В конфигурации нет пиров.", reply_markup=main_menu_keyboard())
             return
@@ -719,20 +799,55 @@ async def list_peers(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not line.strip():
                     continue
                 parts = line.split('\t')
-                if len(parts) >= 8:
+                if len(parts) >= 5:
                     pub_key = normalize_key(parts[0])
                     active_peers[pub_key] = {
-                        'last_handshake': parts[4],
-                        'received': parts[5],
-                        'sent': parts[6]
+                        'last_handshake': parts[4] if len(parts) > 4 else '0',
+                        'received': parts[5] if len(parts) > 5 else '0',
+                        'sent': parts[6] if len(parts) > 6 else '0',
+                        'endpoint': parts[2] if len(parts) > 2 else '',
+                        'allowed_ips': parts[3] if len(parts) > 3 else ''
                     }
+        # Prepare sorting
+        meta_all = load_client_meta()
+        now_ts_local = int(time.time())
+        peers_detailed = []
         for pub_key, peer_name in peer_list:
-            peer_info = active_peers.get(pub_key)
+            peers_detailed.append((pub_key, peer_name, active_peers.get(pub_key)))
+        def sort_key(item):
+            pub_key, peer_name, info = item
+            lh = int(info.get('last_handshake', '0')) if info else 0
+            if lh != 0 and now_ts_local - lh <= ONLINE_THRESHOLD:
+                status_priority = 0  # 🟢 онлайн
+            elif lh == 0:
+                status_priority = 2  # 🟡 подключен (нет handshake)
+            else:
+                status_priority = 1  # 🔴 оффлайн
+            return (status_priority,)
+        peers_detailed.sort(key=sort_key)
+        # Build response
+        for pub_key, peer_name, peer_info in peers_detailed:
             if peer_info:
-                last_handshake = format_handshake_time(peer_info['last_handshake']) if peer_info['last_handshake'] != '0' else "никогда"
-                received = format_traffic(int(peer_info['received']))
-                sent = format_traffic(int(peer_info['sent']))
-                online_status = "🟢 онлайн" if is_peer_online(peer_info['last_handshake']) else "🟡 подключен (нет handshake)"
+                last_hs_raw = peer_info.get('last_handshake', '0')
+                try:
+                    lh_int = int(last_hs_raw)
+                except:
+                    lh_int = 0
+                if lh_int != 0 and now_ts_local - lh_int <= ONLINE_THRESHOLD:
+                    online_status = "🟢 онлайн"
+                elif lh_int == 0:
+                    online_status = "🟡 подключен (нет handshake)"
+                else:
+                    online_status = f"🔴 оффлайн (последний handshake {time_since(lh_int)})"
+                last_handshake = format_handshake_time(last_hs_raw) if last_hs_raw != '0' else "никогда"
+                try:
+                    received = format_traffic(int(peer_info.get('received', 0)))
+                except:
+                    received = format_traffic(0)
+                try:
+                    sent = format_traffic(int(peer_info.get('sent', 0)))
+                except:
+                    sent = format_traffic(0)
                 response += (
                     f"🔹 <b>{peer_name}</b> ({online_status})\n"
                     f"├ Последнее подключение: {last_handshake}\n"
@@ -746,7 +861,6 @@ async def list_peers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text=response, parse_mode='HTML', reply_markup=main_menu_keyboard())
     except Exception as e:
         await query.edit_message_text(text=f"❌ Ошибка при получении списка пиров: {e}", reply_markup=main_menu_keyboard())
-
 async def peer_info_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
@@ -777,6 +891,7 @@ async def peer_info_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await query.edit_message_text(f"❌ Ошибка: {e}", reply_markup=main_menu_keyboard())
 
+
 async def peer_info_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
@@ -798,8 +913,8 @@ async def peer_info_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     peer_found = True
                     peer_info = {
                         'last_handshake': parts[4],
-                        'received': int(parts[5]),
-                        'sent': int(parts[6]),
+                        'received': int(parts[5]) if parts[5].isdigit() else 0,
+                        'sent': int(parts[6]) if parts[6].isdigit() else 0,
                         'endpoint': parts[2],
                         'allowed_ips': parts[3]
                     }
@@ -827,36 +942,30 @@ async def peer_info_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
         monthly_stats = get_monthly_stats().get(peer_pub_key, {'initial_rx': 0, 'initial_tx': 0})
         monthly_rx = max(0, peer_info['received'] - monthly_stats.get('initial_rx', 0))
         monthly_tx = max(0, peer_info['sent'] - monthly_stats.get('initial_tx', 0))
-        last_handshake = format_handshake_time(peer_info['last_handshake'])
-        total_received = format_traffic(peer_info['received'])
-        total_sent = format_traffic(peer_info['sent'])
+        last_handshake = format_handshake_time(str(peer_info.get('last_handshake', '0')))
+        total_received = format_traffic(peer_info.get('received', 0))
+        total_sent = format_traffic(peer_info.get('sent', 0))
         monthly_received = format_traffic(monthly_rx)
         monthly_sent = format_traffic(monthly_tx)
-        online_status = "🟢 онлайн" if is_peer_online(peer_info['last_handshake']) else "🔴 оффлайн"
-        endpoint = peer_info['endpoint'] if peer_info['endpoint'] != '(none)' else "не подключен"
+        try:
+            lh_int = int(peer_info.get('last_handshake', 0))
+        except:
+            lh_int = 0
+        if lh_int != 0 and (int(time.time()) - lh_int) <= ONLINE_THRESHOLD:
+            online_status = "🟢 онлайн"
+        elif lh_int == 0:
+            online_status = "🟡 подключен (нет handshake)"
+        else:
+            online_status = f"🔴 оффлайн (последний handshake {time_since(lh_int)})"
         response = (
-            f"ℹ️ <b>Информация о пире</b> <b>{peer_name}</b>\n"
-            f"<code>{peer_pub_key[:10]}...</code>\n\n"
-            f"<b>Статус:</b> {online_status}\n"
-            f"<b>Endpoint:</b> {endpoint}\n"
-            f"<b>Allowed IPs:</b> {peer_info['allowed_ips']}\n"
-            f"<b>Последнее подключение:</b> {last_handshake}\n"
-            f"<b>Трафик (всего):</b>\n"
-            f"  📥 {total_received}\n"
-            f"  📤 {total_sent}\n"
-            f"<b>Трафик за месяц:</b>\n"
-            f"  📥 {monthly_received}\n"
-            f"  📤 {monthly_sent}\n"
+            f"🔹 <b>{peer_name}</b> ({online_status})\n"
+            f"└ Трафик: 📥 {total_received}  📤 {total_sent}\n"
+            f"└ За месяц: 📥 {monthly_received}  📤 {monthly_sent}\n"
+            f"└ Последний handshake: {last_handshake}\n"
         )
-        # add download buttons
-        keyboard = [
-            [InlineKeyboardButton("📱 Скачать QR", callback_data=f'download_qr_{peer_pub_key}')],
-            [InlineKeyboardButton("📄 Скачать .conf", callback_data=f'download_conf_{peer_pub_key}')],
-            [InlineKeyboardButton("🔙 Назад", callback_data='cancel')]
-        ]
-        await query.edit_message_text(text=response, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(text=response, parse_mode='HTML', reply_markup=main_menu_keyboard())
     except Exception as e:
-        await query.edit_message_text(text=f"❌ Ошибка: {e}", reply_markup=main_menu_keyboard())
+        await query.edit_message_text(text=f"❌ Ошибка получения информации о пире: {e}", reply_markup=main_menu_keyboard())
 
 # -------------------- Download handlers --------------------
 async def download_peer_conf(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -988,6 +1097,8 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # -------------------- Main --------------------
 def main():
+    # CLEAN CONF FIX
+    clean_wg_conf(WG_CONF)
     print("🟢 Бот запускается...")
     ensure_dirs_and_files()
     update_monthly_stats()
