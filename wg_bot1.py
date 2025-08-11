@@ -15,6 +15,17 @@ import json
 import hashlib
 import shutil
 from datetime import datetime
+
+def is_peer_online(last_handshake: str, timeout: int = 180) -> bool:
+    """Проверка, онлайн ли пир по времени последнего рукопожатия."""
+    try:
+        ts = int(last_handshake)
+        if ts == 0:
+            return False
+        now = int(datetime.now().timestamp())
+        return (now - ts) <= timeout
+    except ValueError:
+        return False
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -426,7 +437,7 @@ async def server_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disk_info = subprocess.getoutput("df -h / | awk 'NR==2{printf \"%s/%s\", $3, $2}'")
         wg_stats = subprocess.getoutput(f'wg show {WG_INTERFACE} dump')
         peer_list = []
-        online_peers = []
+        online_peers = []  # будет список (pub_key, last_handshake)
         # Read wg0.conf for PublicKey lines
         if os.path.exists(WG_CONF):
             with open(WG_CONF, 'r') as f:
@@ -721,7 +732,7 @@ async def list_peers(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 last_handshake = format_handshake_time(peer_info['last_handshake']) if peer_info['last_handshake'] != '0' else "никогда"
                 received = format_traffic(int(peer_info['received']))
                 sent = format_traffic(int(peer_info['sent']))
-                online_status = "🟢 онлайн" if peer_info['last_handshake'] != '0' else "🟡 подключен (нет handshake)"
+                online_status = "🟢 онлайн" if is_peer_online(peer_info['last_handshake']) else "🟡 подключен (нет handshake)"
                 response += (
                     f"🔹 <b>{peer_name}</b> ({online_status})\n"
                     f"├ Последнее подключение: {last_handshake}\n"
@@ -821,7 +832,7 @@ async def peer_info_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_sent = format_traffic(peer_info['sent'])
         monthly_received = format_traffic(monthly_rx)
         monthly_sent = format_traffic(monthly_tx)
-        online_status = "🟢 онлайн" if peer_info['last_handshake'] != '0' else "🔴 оффлайн"
+        online_status = "🟢 онлайн" if is_peer_online(peer_info['last_handshake']) else "🔴 оффлайн"
         endpoint = peer_info['endpoint'] if peer_info['endpoint'] != '(none)' else "не подключен"
         response = (
             f"ℹ️ <b>Информация о пире</b> <b>{peer_name}</b>\n"
