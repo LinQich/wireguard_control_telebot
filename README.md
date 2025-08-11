@@ -1,3 +1,1 @@
-sudo ./install_wg_bot.sh full   # Полная установка вместе с сервером wireguard
-
-sudo ./install_wg_bot.sh light  # облегченная установка, только бот (в случае если Wieguard сервер установлен)
+sudo bash -c "$(command -v wget >/dev/null 2>&1 && wget -qO- https://raw.githubusercontent.com/LinQich/wireguard_control_telebot/main/install_wg_bot.sh || curl -fsSL https://raw.githubusercontent.com/LinQich/wireguard_control_telebot/main/install_wg_bot.sh)"
