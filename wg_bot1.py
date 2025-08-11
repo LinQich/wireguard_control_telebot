@@ -405,31 +405,52 @@ def get_monthly_stats() -> dict:
     return stats
 
 def update_monthly_stats():
-    today = datetime.now()
-    if today.day != 1:
-        return
+    pass
+
+
+def update_traffic_stats_json():
+    """Собирает статистику wg и сохраняет в компактный JSON"""
     try:
         wg_show = subprocess.getoutput(f'wg show {WG_INTERFACE} dump')
         if not wg_show:
             return
-        stats = {}
+        peers_data = {}
+        ts_now = int(time.time())
         for line in wg_show.splitlines()[1:]:
             if not line.strip():
                 continue
-            parts = line.split('\t')
-            if len(parts) >= 7:
-                pub_key = normalize_key(parts[0])
-                rx = parts[5]
-                tx = parts[6]
-                stats[pub_key] = f"{rx}:{tx}"
-        with open(STAT_FILE, 'w') as f:
-            f.write("# Формат: <public_key>=<rx_bytes>:<tx_bytes>\n")
-            for k, v in stats.items():
-                f.write(f"{k}={v}\n")
+            parts = line.split('	')
+            pub_key = normalize_key(parts[0]) if len(parts) > 0 else ""
+            endpoint = parts[2] if len(parts) > 2 else ""
+            allowed_ips = parts[3] if len(parts) > 3 else ""
+            try:
+                lh = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
+            except:
+                lh = 0
+            try:
+                rx = int(parts[5]) if len(parts) > 5 and parts[5].isdigit() else 0
+            except:
+                rx = 0
+            try:
+                tx = int(parts[6]) if len(parts) > 6 and parts[6].isdigit() else 0
+            except:
+                tx = 0
+            if pub_key:
+                peers_data[pub_key] = {
+                    "lh": lh,
+                    "rx": rx,
+                    "tx": tx,
+                    "ep": endpoint,
+                    "ip": allowed_ips
+                }
+        os.makedirs(os.path.dirname(TRAFFIC_STATS_FILE), exist_ok=True)
+        with open(TRAFFIC_STATS_FILE, "w") as f:
+            json.dump({"ts": ts_now, "peers": peers_data}, f, separators=(",", ":"))
+        os.chmod(TRAFFIC_STATS_FILE, 0o600)
     except Exception as e:
-        print(f"⚠️ Ошибка обновления статистики: {e}")
+        print(f"⚠️ Ошибка обновления {TRAFFIC_STATS_FILE}: {e}")
 
-# -------------------- find_available_ip --------------------
+
 def find_available_ip() -> str:
     server_ip = SERVER_PARAMS.get('SERVER_WG_IPV4', '') or '10.66.66.1'
     parts = server_ip.split('.')
