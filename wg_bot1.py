@@ -15,6 +15,31 @@ import qrcode
 import json
 import hashlib
 import shutil
+
+def safe_edit_message(bot, call, new_text, reply_markup=None, parse_mode=None):
+    try:
+        current_text = getattr(call.message, 'text', '') or ""
+        # Get current markup as dict if possible
+        try:
+            current_markup = call.message.reply_markup.to_dict() if call.message.reply_markup else None
+        except AttributeError:
+            current_markup = None
+        try:
+            new_markup = reply_markup.to_dict() if reply_markup else None
+        except AttributeError:
+            new_markup = None
+        if current_text.strip() == (new_text or "").strip() and current_markup == new_markup:
+            return  # Don't edit if both text and markup are the same
+        bot.edit_message_text(chat_id=call.message.chat.id,
+                              message_id=call.message.message_id,
+                              text=new_text,
+                              reply_markup=reply_markup,
+                              parse_mode=parse_mode)
+    except Exception as e:
+        if "Message is not modified" in str(e):
+            return  # Ignore this specific error
+        raise
+
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -461,7 +486,7 @@ async def server_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         uptime = subprocess.getoutput('uptime -p')
         load = subprocess.getoutput("cat /proc/loadavg | awk '{print $1\", \"$2\", \"$3}'")
-        mem_info = subprocess.getoutput("free -m | awk '/Mem/{printf \"%.1f/%.1f GB\", $3/1024, $2/1024}'")
+        mem_info = subprocess.getoutput("free -m | awk '/Mem/{printf \"%d/%d MB\", $3, $2}'")
         disk_info = subprocess.getoutput("df -h / | awk 'NR==2{printf \"%s/%s\", $3, $2}'")
         wg_stats = subprocess.getoutput(f'wg show {WG_INTERFACE} dump')
         peer_list = []
