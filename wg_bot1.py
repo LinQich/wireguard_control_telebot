@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WireGuard Telegram Admin Bot (expanded)
-- Stores client files in /etc/wireguard/clients
-- Generates .conf and QR on the fly from stored client metadata
-- Removes client files when peer deleted
+WireGuard Telegram Admin Bot (expanded) — модифицированная версия
+- Хранит накопленные RX/TX/last_handshake в /etc/wireguard/stat
+- Хранит месячный снимок (начальные значения на 1-е) в /etc/wireguard/stat_monthly
+- При каждом сохранении (каждую минуту) аккумулирует трафик и корректно учитывает сбросы счётчиков
+- При показе информации использует свежие данные из `wg show wg0 dump`, а "за месяц" = накопленное - месячный снимок
 """
 
 import os
@@ -15,30 +16,8 @@ import qrcode
 import json
 import hashlib
 import shutil
-
-def safe_edit_message(bot, call, new_text, reply_markup=None, parse_mode=None):
-    try:
-        current_text = getattr(call.message, 'text', '') or ""
-        # Get current markup as dict if possible
-        try:
-            current_markup = call.message.reply_markup.to_dict() if call.message.reply_markup else None
-        except AttributeError:
-            current_markup = None
-        try:
-            new_markup = reply_markup.to_dict() if reply_markup else None
-        except AttributeError:
-            new_markup = None
-        if current_text.strip() == (new_text or "").strip() and current_markup == new_markup:
-            return  # Don't edit if both text and markup are the same
-        bot.edit_message_text(chat_id=call.message.chat.id,
-                              message_id=call.message.message_id,
-                              text=new_text,
-                              reply_markup=reply_markup,
-                              parse_mode=parse_mode)
-    except Exception as e:
-        if "Message is not modified" in str(e):
-            return  # Ignore this specific error
-        raise
+import signal
+import sys
 
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -51,36 +30,17 @@ from telegram.ext import (
     filters
 )
 
-# CLEAN CONF FIX — исправление формата Key = Value
-def clean_wg_conf(path):
-    """Приводит конфиг WireGuard к формату 'Key = Value'"""
-    import re
-    try:
-        if not os.path.exists(path):
-            return
-        lines_out = []
-        with open(path, 'r') as f:
-            for line in f:
-                # Исправляем только строки с ключами в формате Key=Value (без пробела)
-                if re.match(r'^[A-Za-z]+=[^=]', line):
-                    key, value = line.split('=', 1)
-                    line = f"{key.strip()} = {value.lstrip()}"
-                lines_out.append(line)
-        with open(path, 'w') as f:
-            f.writelines(lines_out)
-    except Exception as e:
-        print(f"⚠️ Ошибка clean_wg_conf: {e}")
+# -------------------- Константы --------------------
 
-
-
-# -------------------- Paths --------------------
+# Paths
 PARAMS_FILE = "/etc/wireguard/params"
 BOT_PARAMS_FILE = "/etc/wireguard/bot_params"
 WG_CONF = "/etc/wireguard/wg0.conf"
 CLIENT_NAMES_FILE = "/etc/wireguard/client_names"
 CLIENT_DIR = "/etc/wireguard/clients"
 TEMP_DIR = "/tmp/wg_bot"
-STAT_FILE = "/etc/wireguard/stat"
+STAT_FILE = "/etc/wireguard/stat"                 # накопленные totals + last_handshake
+STAT_MONTHLY_FILE = "/etc/wireguard/stat_monthly" # снимок на 1-е число месяца (initial values)
 WG_INTERFACE = "wg0"
 
 # -------------------- Helpers --------------------
@@ -180,7 +140,6 @@ def normalize_key(key: str) -> str:
 def safe_filename_from_key(pubkey: str) -> str:
     """
     Make a safe filename for storing client files based on public key.
-    Replace unsafe chars by URL-safe base64 alternative or use sha256 if prefer.
     We'll use sha256 to avoid any filesystem char issues.
     """
     h = hashlib.sha256(pubkey.encode('utf-8')).hexdigest()
@@ -225,10 +184,17 @@ def ensure_dirs_and_files():
     if not os.path.exists(STAT_FILE):
         try:
             with open(STAT_FILE, 'w') as f:
-                f.write("# Формат: <public_key>=<rx_bytes>:<tx_bytes>\n")
+                f.write("# Формат: <public_key>=<rx_bytes>:<tx_bytes>:<last_handshake>\n")
             os.chmod(STAT_FILE, 0o600)
         except Exception as e:
             print(f"⚠️ Ошибка создания {STAT_FILE}: {e}")
+    if not os.path.exists(STAT_MONTHLY_FILE):
+        try:
+            with open(STAT_MONTHLY_FILE, 'w') as f:
+                f.write("# Формат: <public_key>=<initial_rx_bytes>:<initial_tx_bytes>\n")
+            os.chmod(STAT_MONTHLY_FILE, 0o600)
+        except Exception as e:
+            print(f"⚠️ Ошибка создания {STAT_MONTHLY_FILE}: {e}")
 
 # -------------------- Client names (left: key, right: name) --------------------
 def load_client_names() -> dict:
@@ -358,7 +324,7 @@ def build_client_conf_from_meta(meta_entry: dict) -> str:
     server_port = SERVER_PARAMS.get('SERVER_PORT', '')
     client_dns_1 = SERVER_PARAMS.get('CLIENT_DNS_1', '')
     client_dns_2 = SERVER_PARAMS.get('CLIENT_DNS_2', '')
-    allowed_ips = SERVER_PARAMS.get('ALLOWED_IPS', '0.0.0.0/0')
+    allowed_ips = '0.0.0.0/0'
     priv = meta_entry.get('priv', '')
     ip = meta_entry.get('ip', '')
     psk = meta_entry.get('psk', '')
@@ -371,7 +337,7 @@ DNS = {client_dns_1},{client_dns_2}
 PublicKey = {server_pub_key}
 PresharedKey = {psk}
 Endpoint = {server_endpoint}:{server_port}
-AllowedIPs = {allowed_ips}
+                        f"AllowedIPs = 0.0.0.0/0\n"
 PersistentKeepalive = 25
 """
     return conf_content
@@ -380,8 +346,8 @@ PersistentKeepalive = 25
 def get_monthly_stats() -> dict:
     stats = {}
     try:
-        if os.path.exists(STAT_FILE):
-            with open(STAT_FILE, 'r') as f:
+        if os.path.exists(STAT_MONTHLY_FILE):
+            with open(STAT_MONTHLY_FILE, 'r') as f:
                 for raw in f:
                     line = raw.strip()
                     if not line or line.startswith('#'):
@@ -389,8 +355,10 @@ def get_monthly_stats() -> dict:
                     if '=' in line:
                         pub_key, values = line.split('=', 1)
                         nk = normalize_key(pub_key)
-                        if ':' in values:
-                            rx, tx = values.split(':', 1)
+                        parts = values.split(':')
+                        if len(parts) >= 2:
+                            rx = parts[0]
+                            tx = parts[1]
                         else:
                             rx, tx = '0', '0'
                         try:
@@ -401,56 +369,129 @@ def get_monthly_stats() -> dict:
                         except:
                             stats[nk] = {'initial_rx': 0, 'initial_tx': 0}
     except Exception as e:
-        print(f"⚠️ Ошибка чтения файла статистики: {e}")
+        print(f"⚠️ Ошибка чтения файла месячной статистики: {e}")
     return stats
 
 def update_monthly_stats():
-    pass
-
-
-def update_traffic_stats_json():
-    """Собирает статистику wg и сохраняет в компактный JSON"""
+    today = datetime.now()
+    if today.day != 1:
+        return
     try:
         wg_show = subprocess.getoutput(f'wg show {WG_INTERFACE} dump')
         if not wg_show:
             return
-        peers_data = {}
-        ts_now = int(time.time())
+        stats = {}
         for line in wg_show.splitlines()[1:]:
             if not line.strip():
                 continue
-            parts = line.split('	')
-            pub_key = normalize_key(parts[0]) if len(parts) > 0 else ""
-            endpoint = parts[2] if len(parts) > 2 else ""
-            allowed_ips = parts[3] if len(parts) > 3 else ""
-            try:
-                lh = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
-            except:
-                lh = 0
-            try:
-                rx = int(parts[5]) if len(parts) > 5 and parts[5].isdigit() else 0
-            except:
-                rx = 0
-            try:
-                tx = int(parts[6]) if len(parts) > 6 and parts[6].isdigit() else 0
-            except:
-                tx = 0
-            if pub_key:
-                peers_data[pub_key] = {
-                    "lh": lh,
-                    "rx": rx,
-                    "tx": tx,
-                    "ep": endpoint,
-                    "ip": allowed_ips
-                }
-        os.makedirs(os.path.dirname(TRAFFIC_STATS_FILE), exist_ok=True)
-        with open(TRAFFIC_STATS_FILE, "w") as f:
-            json.dump({"ts": ts_now, "peers": peers_data}, f, separators=(",", ":"))
-        os.chmod(TRAFFIC_STATS_FILE, 0o600)
+            parts = line.split()
+            if len(parts) >= 7:
+                pub_key = normalize_key(parts[0])
+                rx = parts[5]
+                tx = parts[6]
+                stats[pub_key] = f"{rx}:{tx}"
+        # write monthly snapshot
+        try:
+            tmp_path = STAT_MONTHLY_FILE + '.tmp'
+            with open(tmp_path, 'w') as f:
+                f.write("# Формат: <public_key>=<initial_rx_bytes>:<initial_tx_bytes>\n")
+                for k, v in stats.items():
+                    f.write(f"{k}={v}\n")
+            os.replace(tmp_path, STAT_MONTHLY_FILE)
+        except Exception:
+            with open(STAT_MONTHLY_FILE, 'w') as f:
+                f.write("# Формат: <public_key>=<initial_rx_bytes>:<initial_tx_bytes>\n")
+                for k, v in stats.items():
+                    f.write(f"{k}={v}\n")
     except Exception as e:
-        print(f"⚠️ Ошибка обновления {TRAFFIC_STATS_FILE}: {e}")
+        print(f"⚠️ Ошибка обновления месячной статистики: {e}")
 
+def save_current_stats():
+    """Сохраняет накопленные RX/TX и last_handshake в STAT_FILE, учитывая сброс счётчиков."""
+    try:
+        # Загружаем старые накопленные данные (если есть)
+        old_stats = {}
+        if os.path.exists(STAT_FILE):
+            with open(STAT_FILE, 'r') as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if '=' in line:
+                        pub_key, values = line.split('=', 1)
+                        parts = values.split(':')
+                        if len(parts) >= 3:
+                            try:
+                                old_rx = int(parts[0])
+                            except:
+                                old_rx = 0
+                            try:
+                                old_tx = int(parts[1])
+                            except:
+                                old_tx = 0
+                            try:
+                                old_hs = int(parts[2])
+                            except:
+                                old_hs = 0
+                            old_stats[normalize_key(pub_key)] = {
+                                'rx': old_rx,
+                                'tx': old_tx,
+                                'last_handshake': old_hs
+                            }
+        # Получаем свежие данные wg
+        wg_show = subprocess.getoutput(f'wg show {WG_INTERFACE} dump')
+        if not wg_show:
+            return
+        stats = {}
+        for line in wg_show.splitlines()[1:]:
+            if not line.strip():
+                continue
+            parts = line.split()
+            if len(parts) >= 7:
+                pub_key = normalize_key(parts[0])
+                last_hs = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
+                rx_now = int(parts[5])
+                tx_now = int(parts[6])
+                # Берём старые накопленные значения
+                prev = old_stats.get(pub_key, {'rx': 0, 'tx': 0, 'last_handshake': 0})
+                # Рассчитываем новые накопленные totals.
+                # Если счётчик уменьшился — значит он был обнулён, прибавляем текущие к накопленному.
+                # Иначе — добавляем разницу между текущим и предыдущим счётчиком.
+                if rx_now < prev['rx']:
+                    rx_total = prev['rx'] + rx_now
+                else:
+                    rx_total = prev['rx'] + (rx_now - prev['rx']) if prev['rx'] > 0 else prev['rx'] + rx_now
+                if tx_now < prev['tx']:
+                    tx_total = prev['tx'] + tx_now
+                else:
+                    tx_total = prev['tx'] + (tx_now - prev['tx']) if prev['tx'] > 0 else prev['tx'] + tx_now
+                stats[pub_key] = f"{rx_total}:{tx_total}:{last_hs}"
+        # write atomically
+        try:
+            tmp_path = STAT_FILE + '.tmp'
+            with open(tmp_path, 'w') as f:
+                f.write("# Формат: <public_key>=<rx_bytes>:<tx_bytes>:<last_handshake>\n")
+                for k, v in stats.items():
+                    f.write(f"{k}={v}\n")
+            os.replace(tmp_path, STAT_FILE)
+            print(f"✅ Статистика сохранена. Всего пиров: {len(stats)}")
+        except Exception:
+            with open(STAT_FILE, 'w') as f:
+                f.write("# Формат: <public_key>=<rx_bytes>:<tx_bytes>:<last_handshake>\n")
+                for k, v in stats.items():
+                    f.write(f"{k}={v}\n")
+            print(f"✅ Статистика сохранена (fallback). Всего пиров: {len(stats)}")
+    except Exception as e:
+        print(f"⚠️ Ошибка сохранения текущей статистики: {e}")
 
+async def periodic_stats_save(context: ContextTypes.DEFAULT_TYPE):
+    """Job для периодического сохранения статистики."""
+    try:
+        save_current_stats()
+    except Exception as e:
+        print(f"⚠️ Ошибка в periodic_stats_save: {e}")
+
+# -------------------- find_available_ip --------------------
 def find_available_ip() -> str:
     server_ip = SERVER_PARAMS.get('SERVER_WG_IPV4', '') or '10.66.66.1'
     parts = server_ip.split('.')
@@ -499,6 +540,52 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text('🔹 Выберите действие:', reply_markup=main_menu_keyboard())
 
+def load_current_stats() -> dict:
+    """Читает текущие накопленные RX/TX/last_handshake из STAT_FILE"""
+    data = {}
+    try:
+        if os.path.exists(STAT_FILE):
+            with open(STAT_FILE, 'r') as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if '=' in line:
+                        pub_key, values = line.split('=', 1)
+                        nk = normalize_key(pub_key)
+                        parts = values.split(':')
+                        # поддерживаем формат с 3 полями и старый формат с 2 полями
+                        if len(parts) >= 3:
+                            try:
+                                rx = int(parts[0])
+                            except:
+                                rx = 0
+                            try:
+                                tx = int(parts[1])
+                            except:
+                                tx = 0
+                            try:
+                                last_hs = int(parts[2])
+                            except:
+                                last_hs = 0
+                        elif len(parts) == 2:
+                            try:
+                                rx = int(parts[0])
+                            except:
+                                rx = 0
+                            try:
+                                tx = int(parts[1])
+                            except:
+                                tx = 0
+                            last_hs = 0
+                        else:
+                            rx = tx = last_hs = 0
+                        data[nk] = {'rx': rx, 'tx': tx, 'last_handshake': last_hs}
+    except Exception as e:
+        print(f"⚠️ Ошибка чтения текущей статистики: {e}")
+    return data
+
+
 async def server_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
@@ -509,7 +596,7 @@ async def server_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         load = subprocess.getoutput("cat /proc/loadavg | awk '{print $1\", \"$2\", \"$3}'")
         mem_info = subprocess.getoutput("free -m | awk '/Mem/{printf \"%d/%d MB\", $3, $2}'")
         disk_info = subprocess.getoutput("df -h / | awk 'NR==2{printf \"%s/%s\", $3, $2}'")
-        wg_stats = subprocess.getoutput(f'wg show {WG_INTERFACE} dump')
+        stats_file_data = load_current_stats()
         peer_list = []
         # Read wg0.conf for PublicKey lines
         if os.path.exists(WG_CONF):
@@ -525,22 +612,18 @@ async def server_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         meta_all = load_client_meta()
         now_ts = int(time.time())
         interface_info = []
-        if wg_stats:
-            lines = wg_stats.splitlines()
+        # get interface info from wg show
+        wg_show = subprocess.getoutput(f'wg show {WG_INTERFACE} dump')
+        if wg_show:
+            lines = wg_show.splitlines()
             if lines:
-                interface_info = lines[0].split('\t')
-            for line in lines[1:]:
-                if not line.strip():
-                    continue
-                parts = line.split('\t')
-                # parts[0]=pubkey, parts[4]=last_handshake
-                if len(parts) >= 5 and parts[4] != '0':
-                    try:
-                        last_hs = int(parts[4])
-                    except:
-                        continue
-                    if now_ts - last_hs <= ONLINE_THRESHOLD:
-                        online_peers.append(parts[0])
+                interface_info = lines[0].split()
+        # determine online peers from stats file
+        if stats_file_data:
+            for pk, info in stats_file_data.items():
+                last_hs = int(info.get('last_handshake', 0)) if info.get('last_handshake', 0) else 0
+                if last_hs != 0 and (now_ts - last_hs) <= ONLINE_THRESHOLD:
+                    online_peers.append(pk)
         client_names = load_client_names()
         online_peers_names = []
         # try to get IPs for online peers (last two octets)
@@ -601,7 +684,7 @@ async def server_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return [0,0]
             for name, last_octets in sorted(online_peers_names, key=lambda t: _oct_key(t[1])):
                 response += f"• 🟢{name} - {last_octets}\n"
-        if wg_stats and interface_info and len(interface_info) >= 5:
+        if interface_info and len(interface_info) >= 5:
             response += (
                 f"\n<b>Интерфейс {WG_INTERFACE}:</b>\n"
                 f"Порт: {interface_info[4]}\n"
@@ -636,7 +719,7 @@ async def handle_peer_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         server_port = SERVER_PARAMS.get('SERVER_PORT', '')
         client_dns_1 = SERVER_PARAMS.get('CLIENT_DNS_1', '1.1.1.1')
         client_dns_2 = SERVER_PARAMS.get('CLIENT_DNS_2', '8.8.8.8')
-        allowed_ips = SERVER_PARAMS.get('ALLOWED_IPS', '0.0.0.0/0')
+        allowed_ips = '0.0.0.0/0'
         peer_ip = find_available_ip()
         # generate keys
         priv_key = subprocess.getoutput('wg genkey').strip()
@@ -663,18 +746,29 @@ async def handle_peer_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # save client name and meta/conf
         save_client_name(pub_key, peer_name)
         save_client_meta(pub_key, priv_key, psk_key, peer_ip, peer_name)
-        # add stat
+        # add stat entry with initial zeros (3 fields)
         try:
             with open(STAT_FILE, 'a') as f:
-                f.write(f"{pub_key}=0:0\n")
+                f.write(f"{pub_key}=0:0:0\n")
         except Exception as e:
             print(f"⚠️ Не удалось обновить stat: {e}")
         # save wg config
         save_result = subprocess.run(['sudo', 'wg-quick', 'save', WG_INTERFACE], capture_output=True, text=True)
         if save_result.returncode != 0:
             print(f"⚠️ Не удалось сохранить конфиг: {save_result.stderr}")
-        # prepare temporary files for sending
-        conf_content = build_client_conf_from_meta({'priv': priv_key, 'psk': psk_key, 'ip': peer_ip, 'name': peer_name})
+        # prepare temporary files for sending and persistent client conf
+        safe_peer_filename = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in peer_name)
+        conf_content = (f"[Interface]\n"
+                        f"PrivateKey = {priv_key}\n"
+                        f"Address = {peer_ip}/24\n"
+                        f"DNS = {client_dns_1},{client_dns_2}\n\n"
+                        f"[Peer]\n"
+                        f"PublicKey = {server_pub_key}\n"
+                        f"PresharedKey = {psk_key}\n"
+                        f"Endpoint = {server_endpoint}:{server_port}\n"
+                        f"AllowedIPs = 0.0.0.0/0\n"
+                        f"PersistentKeepalive = 25\n")
+        # write temp conf file
         conf_filename = os.path.join(TEMP_DIR, f"{safe_filename_from_key(pub_key)}.conf")
         with open(conf_filename, 'w') as f:
             f.write(conf_content)
@@ -684,9 +778,33 @@ async def handle_peer_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         qr_img = qr.make_image(fill_color="black", back_color="white")
         qr_filename = os.path.join(TEMP_DIR, f"{safe_filename_from_key(pub_key)}.png")
         qr_img.save(qr_filename)
+        # Ensure client dir exists and attempt to move conf into it with readable name
+        os.makedirs(CLIENT_DIR, exist_ok=True)
+        peer_conf_path = os.path.join(CLIENT_DIR, f"{safe_peer_filename}.conf")
+        conf_to_send_path = conf_filename
+        try:
+            shutil.move(conf_filename, peer_conf_path)
+            os.chmod(peer_conf_path, 0o600)
+            conf_to_send_path = peer_conf_path
+        except Exception:
+            try:
+                with open(peer_conf_path, 'w') as f_conf:
+                    f_conf.write(conf_content)
+                os.chmod(peer_conf_path, 0o600)
+                try:
+                    if os.path.exists(conf_filename):
+                        os.remove(conf_filename)
+                except:
+                    pass
+                conf_to_send_path = peer_conf_path
+            except Exception:
+                conf_to_send_path = conf_filename
         # send files
-        with open(conf_filename, 'rb') as f:
-            await update.message.reply_document(f, caption=f"📁 Конфигурация для {peer_name}")
+        with open(conf_to_send_path, 'rb') as f:
+            await update.message.reply_document(
+                f,
+                filename=f"{safe_peer_filename}.conf",
+                caption=f"📁 Конфигурация для {peer_name}"            )
         with open(qr_filename, 'rb') as f:
             await update.message.reply_photo(f, caption=f"📲 QR код для {peer_name}")
         await update.message.reply_text(f"✅ Пир {peer_name} успешно добавлен с IP {peer_ip}", reply_markup=main_menu_keyboard())
@@ -700,6 +818,7 @@ async def handle_peer_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except:
                     pass
         context.user_data.clear()
+
 
 async def save_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -804,8 +923,21 @@ async def delete_peer_execute(update: Update, context: ContextTypes.DEFAULT_TYPE
             with open(WG_CONF, 'w') as f:
                 f.writelines(new_lines)
         # remove client name and files
+        client_names = load_client_names()
+        peer_name = client_names.get(peer_pub_key)
         remove_client_name(peer_pub_key)
         remove_client_files(peer_pub_key)
+        # удалить файл имя_пира.conf (читабельный конфиг)
+        if peer_name:
+            # sanitize name to match how we saved it
+            safe_peer_filename = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in peer_name)
+            name_conf_path = os.path.join(CLIENT_DIR, f"{safe_peer_filename}.conf")
+            try:
+                if os.path.exists(name_conf_path):
+                    os.remove(name_conf_path)
+                    print(f"🗑 Удалён файл конфигурации: {name_conf_path}")
+            except Exception as e:
+                print(f"⚠️ Не удалось удалить {name_conf_path}: {e}")
         # save wg config
         save_result = subprocess.run(['sudo', 'wg-quick', 'save', WG_INTERFACE], capture_output=True, text=True)
         if save_result.returncode != 0:
@@ -815,7 +947,6 @@ async def delete_peer_execute(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text(text=f"❌ Ошибка при удалении: {e}", reply_markup=main_menu_keyboard())
     finally:
         context.user_data.clear()
-
 
 async def list_peers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -837,23 +968,57 @@ async def list_peers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not peer_list:
             await query.edit_message_text(" ℹ️ В конфигурации нет пиров.", reply_markup=main_menu_keyboard())
             return
-        wg_show = subprocess.getoutput(f'wg show {WG_INTERFACE} dump')
+        stats_file_data = load_current_stats()
         response = "📋 <b>Список пиров:</b>\n\n"
         active_peers = {}
+        # also fetch wg show to enrich endpoint/allowed_ips if available
+        wg_show = subprocess.getoutput(f'wg show {WG_INTERFACE} dump')
+        wg_peer_info = {}
         if wg_show:
             for line in wg_show.splitlines()[1:]:
                 if not line.strip():
                     continue
-                parts = line.split('\t')
-                if len(parts) >= 5:
-                    pub_key = normalize_key(parts[0])
-                    active_peers[pub_key] = {
+                parts = line.split()
+                if len(parts) >= 4:
+                    pk = normalize_key(parts[0])
+                    wg_peer_info[pk] = {
+                        'endpoint': parts[2] if len(parts) > 2 else '',
+                        'allowed_ips': parts[3] if len(parts) > 3 else '',
                         'last_handshake': parts[4] if len(parts) > 4 else '0',
                         'received': parts[5] if len(parts) > 5 else '0',
-                        'sent': parts[6] if len(parts) > 6 else '0',
-                        'endpoint': parts[2] if len(parts) > 2 else '',
-                        'allowed_ips': parts[3] if len(parts) > 3 else ''
+                        'sent': parts[6] if len(parts) > 6 else '0'
                     }
+        # Обновляем active_peers: приоритет у wg_peer_info (актуальные значения), fallback — stats_file_data (накопленные)
+        if wg_peer_info:
+            for pk, wg_info in wg_peer_info.items():
+                try:
+                    rec = int(wg_info.get('received', 0))
+                except:
+                    rec = 0
+                try:
+                    snt = int(wg_info.get('sent', 0))
+                except:
+                    snt = 0
+                try:
+                    lh = int(wg_info.get('last_handshake', 0))
+                except:
+                    lh = 0
+                active_peers[pk] = {
+                    'last_handshake': lh,
+                    'received': rec,
+                    'sent': snt,
+                    'endpoint': wg_info.get('endpoint', ''),
+                    'allowed_ips': wg_info.get('allowed_ips', '')
+                }
+        elif stats_file_data:
+            for pk, info in stats_file_data.items():
+                active_peers[pk] = {
+                    'last_handshake': info.get('last_handshake', 0),
+                    'received': info.get('rx', 0),
+                    'sent': info.get('tx', 0),
+                    'endpoint': '',
+                    'allowed_ips': ''
+                }
         # Prepare sorting
         meta_all = load_client_meta()
         now_ts_local = int(time.time())
@@ -885,7 +1050,7 @@ async def list_peers(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     online_status = "🟡 подключен (нет handshake)"
                 else:
                     online_status = f"🔴 оффлайн (последний handshake {time_since(lh_int)})"
-                last_handshake = format_handshake_time(last_hs_raw) if last_hs_raw != '0' else "никогда"
+                last_handshake = format_handshake_time(str(last_hs_raw)) if str(last_hs_raw) != '0' else "никогда"
                 try:
                     received = format_traffic(int(peer_info.get('received', 0)))
                 except:
@@ -907,6 +1072,7 @@ async def list_peers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text=response, parse_mode='HTML', reply_markup=main_menu_keyboard())
     except Exception as e:
         await query.edit_message_text(text=f"❌ Ошибка при получении списка пиров: {e}", reply_markup=main_menu_keyboard())
+
 async def peer_info_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
@@ -947,24 +1113,59 @@ async def peer_info_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         client_names = load_client_names()
         peer_name = client_names.get(peer_pub_key, "неизвестный пир")
-        wg_show = subprocess.getoutput(f'wg show {WG_INTERFACE} dump')
+        stats_file_data = load_current_stats()
         peer_found = False
         peer_info = None
+        # also load wg show info for endpoint/allowed_ips
+        wg_show = subprocess.getoutput(f'wg show {WG_INTERFACE} dump')
+        wg_peer_info = {}
         if wg_show:
             for line in wg_show.splitlines()[1:]:
                 if not line.strip():
                     continue
-                parts = line.split('\t')
-                if len(parts) >= 8 and normalize_key(parts[0]) == peer_pub_key:
-                    peer_found = True
-                    peer_info = {
-                        'last_handshake': parts[4],
-                        'received': int(parts[5]) if parts[5].isdigit() else 0,
-                        'sent': int(parts[6]) if parts[6].isdigit() else 0,
-                        'endpoint': parts[2],
-                        'allowed_ips': parts[3]
+                parts = line.split()
+                if len(parts) >= 4:
+                    pk = normalize_key(parts[0])
+                    wg_peer_info[pk] = {
+                        'endpoint': parts[2] if len(parts) > 2 else '',
+                        'allowed_ips': parts[3] if len(parts) > 3 else '',
+                        'last_handshake': parts[4] if len(parts) > 4 else '0',
+                        'received': parts[5] if len(parts) > 5 else '0',
+                        'sent': parts[6] if len(parts) > 6 else '0'
                     }
-                    break
+        # Приоритет — wg_peer_info (актуальные значения). Если нет — брать из сохранённого stat.
+        if peer_pub_key in wg_peer_info:
+            wg_info = wg_peer_info[peer_pub_key]
+            try:
+                rx_now = int(wg_info.get('received', 0))
+            except:
+                rx_now = 0
+            try:
+                tx_now = int(wg_info.get('sent', 0))
+            except:
+                tx_now = 0
+            try:
+                hs_now = int(wg_info.get('last_handshake', 0))
+            except:
+                hs_now = 0
+            peer_found = True
+            peer_info = {
+                'last_handshake': hs_now,
+                'received': rx_now,
+                'sent': tx_now,
+                'endpoint': wg_info.get('endpoint', ''),
+                'allowed_ips': wg_info.get('allowed_ips', '')
+            }
+        elif stats_file_data and peer_pub_key in stats_file_data:
+            info = stats_file_data[peer_pub_key]
+            peer_found = True
+            peer_info = {
+                'last_handshake': info.get('last_handshake', 0),
+                'received': info.get('rx', 0),
+                'sent': info.get('tx', 0),
+                'endpoint': wg_peer_info.get(peer_pub_key, {}).get('endpoint', ''),
+                'allowed_ips': wg_peer_info.get(peer_pub_key, {}).get('allowed_ips', '')
+            }
         if not peer_found:
             found_in_conf = False
             if os.path.exists(WG_CONF):
@@ -1009,7 +1210,14 @@ async def peer_info_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"└ За месяц: 📥 {monthly_received}  📤 {monthly_sent}\n"
             f"└ Последний handshake: {last_handshake}\n"
         )
-        await query.edit_message_text(text=response, parse_mode='HTML', reply_markup=main_menu_keyboard())
+        safe_peer_filename = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in peer_name)
+        keyboard = [
+            [InlineKeyboardButton("📁 Скачать .conf", callback_data=f'download_conf_name_{safe_peer_filename}')],
+            [InlineKeyboardButton("📲 Скачать QR", callback_data=f'download_qr_name_{safe_peer_filename}')],
+            [InlineKeyboardButton("🔙 Назад", callback_data='cancel')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(text=response, parse_mode='HTML', reply_markup=reply_markup)
     except Exception as e:
         await query.edit_message_text(text=f"❌ Ошибка получения информации о пире: {e}", reply_markup=main_menu_keyboard())
 
@@ -1019,12 +1227,33 @@ async def download_peer_conf(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     query = update.callback_query
     await query.answer()
-    peer_pub_key = query.data.split('_', 2)[2]
-    # try meta json first
-    meta_path = client_meta_path(peer_pub_key)
-    conf_path = client_conf_path(peer_pub_key)
+    peer_id = query.data.split('_', 2)[2]
     temp_path = None
     try:
+        # Callback format: download_conf_name_<safe_name> or download_conf_<pubkey>
+        if peer_id.startswith('name_'):
+            safe_name = peer_id[len('name_'):]
+            conf_path_by_name = os.path.join(CLIENT_DIR, f"{safe_name}.conf")
+            if os.path.exists(conf_path_by_name):
+                with open(conf_path_by_name, 'rb') as f:
+                    await query.message.reply_document(f, filename=os.path.basename(conf_path_by_name), caption=f"Конфигурация для {safe_name}")
+                await query.edit_message_text(text="✅ Файл отправлен.", reply_markup=main_menu_keyboard())
+                return
+            # try to find pubkey by sanitized name
+            peer_pub_key = None
+            for pk, name in load_client_names().items():
+                safe = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in name)
+                if safe == safe_name:
+                    peer_pub_key = pk
+                    break
+            if not peer_pub_key:
+                await query.edit_message_text(text="❌ Конфигурация с указанным именем не найдена.", reply_markup=main_menu_keyboard())
+                return
+        else:
+            peer_pub_key = peer_id
+
+        meta_path = client_meta_path(peer_pub_key)
+        conf_path = client_conf_path(peer_pub_key)
         if os.path.exists(conf_path):
             # read canonical conf and send
             with open(conf_path, 'rb') as f:
@@ -1057,24 +1286,36 @@ async def download_peer_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     query = update.callback_query
     await query.answer()
-    peer_pub_key = query.data.split('_', 2)[2]
-    meta_path = client_meta_path(peer_pub_key)
+    peer_id = query.data.split('_', 2)[2]
     conf_text = None
     temp_path = None
     try:
-        if os.path.exists(client_conf_path(peer_pub_key)):
-            with open(client_conf_path(peer_pub_key), 'r') as f:
-                conf_text = f.read()
-        elif os.path.exists(meta_path):
-            with open(meta_path, 'r') as f:
-                meta = json.load(f)
-            conf_text = build_client_conf_from_meta(meta)
+        if peer_id.startswith('name_'):
+            safe_name = peer_id[len('name_'):]
+            conf_path_by_name = os.path.join(CLIENT_DIR, f"{safe_name}.conf")
+            if os.path.exists(conf_path_by_name):
+                with open(conf_path_by_name, 'r') as f:
+                    conf_text = f.read()
+            else:
+                await query.edit_message_text(text="❌ Конфигурация с указанным именем не найдена.", reply_markup=main_menu_keyboard())
+                return
         else:
-            await query.edit_message_text(text="❌ Невозможно сгенерировать QR — данные клиента не найдены.", reply_markup=main_menu_keyboard())
+            peer_pub_key = peer_id
+            if os.path.exists(client_conf_path(peer_pub_key)):
+                with open(client_conf_path(peer_pub_key), 'r') as f:
+                    conf_text = f.read()
+            elif os.path.exists(client_meta_path(peer_pub_key)):
+                with open(client_meta_path(peer_pub_key), 'r') as f:
+                    meta = json.load(f)
+                conf_text = build_client_conf_from_meta(meta)
+
+        if not conf_text:
+            await query.edit_message_text(text="❌ Невозможно сгенерировать QR — конфигурация не найдена.", reply_markup=main_menu_keyboard())
             return
+
         # generate QR to temp
         os.makedirs(TEMP_DIR, exist_ok=True)
-        temp_path = os.path.join(TEMP_DIR, f"{safe_filename_from_key(peer_pub_key)}.png")
+        temp_path = os.path.join(TEMP_DIR, f"{peer_id}.png")
         qr = qrcode.QRCode()
         qr.add_data(conf_text)
         qr.make()
@@ -1091,7 +1332,6 @@ async def download_peer_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 os.remove(temp_path)
         except:
             pass
-
 async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
@@ -1142,6 +1382,25 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Выберите действие из меню:", reply_markup=main_menu_keyboard())
 
 # -------------------- Main --------------------
+def clean_wg_conf(path):
+    """Приводит конфиг WireGuard к формату 'Key = Value'"""
+    import re
+    try:
+        if not os.path.exists(path):
+            return
+        lines_out = []
+        with open(path, 'r') as f:
+            for line in f:
+                # Исправляем только строки с ключами в формате Key=Value (без пробела)
+                if re.match(r'^[A-Za-z]+=[^=]', line):
+                    key, value = line.split('=', 1)
+                    line = f"{key.strip()} = {value.lstrip()}"
+                lines_out.append(line)
+        with open(path, 'w') as f:
+            f.writelines(lines_out)
+    except Exception as e:
+        print(f"⚠️ Ошибка clean_wg_conf: {e}")
+
 def main():
     # CLEAN CONF FIX
     clean_wg_conf(WG_CONF)
@@ -1155,10 +1414,33 @@ def main():
             print("❌ Ошибка: TOKEN не задан в /etc/wireguard/bot_params")
             return
         application = Application.builder().token(TOKEN).build()
+        # -------------------- JobQueue for periodic tasks --------------------
+        application.job_queue.run_repeating(periodic_stats_save, interval=60, first=0)
+
+        # -------------------- Signal handlers --------------------
+        try:
+            def _handle_exit(signum, frame):
+                try:
+                    print("🛑 Сохранение статистики перед завершением...")
+                    save_current_stats()
+                except Exception as _e:
+                    print(f"⚠️ Ошибка при сохранении статистики при выходе: {_e}")
+                try:
+                    job_queue.stop()
+                except Exception:
+                    pass
+                sys.exit(0)
+
+            signal.signal(signal.SIGINT, _handle_exit)
+            signal.signal(signal.SIGTERM, _handle_exit)
+        except Exception as e:
+            print(f"⚠️ Не удалось зарегистрировать обработчики сигналов: {e}")
+
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CallbackQueryHandler(button_router))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
         print("🟢 Бот готов к работе!")
+        save_current_stats()  # первая запись сразу при старте
         application.run_polling()
     except Exception as e:
         print(f"❌ Критическая ошибка: {e}")
