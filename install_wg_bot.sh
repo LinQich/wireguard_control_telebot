@@ -142,7 +142,7 @@ install_system_packages() {
 install_python_deps() {
   log "Устанавливаем Python-библиотеки..."
   python3 -m pip install --upgrade pip
-  python3 -m pip install "python-telegram-bot>=20.0" qrcode[pil] Pillow || true
+  python3 -m pip install "python-telegram-bot[job-queue]>=20.0" qrcode[pil] Pillow || true
 }
 
 create_params_interactive() {
